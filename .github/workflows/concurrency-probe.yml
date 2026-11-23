@@ -1,0 +1,149 @@
+# Concurrency Probe (release-sim) —— doc 15.1 §3/§5 实验工作流（非生产）
+# 结构：顶层无 concurrency；verify 组外产生绑定输出；release=执行 job（组+job 级 if 四条件）；finalize 组外严格检查。
+# 测试模式（inputs.mode）：
+#   ok            正常（A/B/C4-C/C5/C6 用）
+#   verify-reject verify 明确失败（C1 的 C）
+#   bind-mismatch verify 成功但输出错误 run_id（C2 的 C）
+#   no-binding    verify 成功但缺少绑定输出（C2 备选）
+#   exec-fail     绑定正确、执行 job 内部失败（C3 的 F）
+name: Concurrency Probe (release-sim)
+run-name: probe-${{ inputs.tag }}
+on:
+  workflow_dispatch:
+    inputs:
+      group:
+        description: "执行 job 的完整并发组名（必须以 insightweave-concurrency-probe- 开头）"
+        required: true
+        type: string
+      tag:
+        description: "batch-case-role 标识（仅用于 run-name/日志标记）"
+        required: true
+        type: string
+      mode:
+        description: "ok | verify-reject | bind-mismatch | no-binding | exec-fail"
+        required: true
+        type: string
+      hold_seconds:
+        description: "执行 job 保持时长（秒）"
+        required: false
+        default: "120"
+        type: string
+      finalize_hold_seconds:
+        description: "finalize 保持时长（秒，C6 用）"
+        required: false
+        default: "0"
+        type: string
+permissions: {}
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      authorized_private_run_id: ${{ steps.bind.outputs.run_id }}
+      authorized_private_attempt: ${{ steps.bind.outputs.attempt }}
+      authorized_triggering_actor: ${{ steps.bind.outputs.actor }}
+    env:
+      MODE: ${{ inputs.mode }}
+      ROLE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Guard group name (never production group)
+        env:
+          G: ${{ inputs.group }}
+        run: |
+          printf '[verify] %s group=%s mode=%s\n' "$(date -u +%FT%TZ)" "$G" "$MODE"
+          case "$G" in
+            insightweave-concurrency-probe-*) ;;
+            *) echo "::error::group 必须以 insightweave-concurrency-probe- 开头（got: $G）"; exit 1 ;;
+          esac
+          case "$G" in
+            *insightweave-local-release*) echo "::error::拒绝生产组名"; exit 1 ;;
+          esac
+      - id: bind
+        name: Produce authorization binding from THIS context (test modes may spoof)
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          set -eu
+          case "$MODE" in
+            ok | exec-fail)
+              printf 'run_id=%s\nattempt=%s\nactor=%s\n' \
+                "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_TRIGGERING_ACTOR" >> "$GITHUB_OUTPUT" ;;
+            bind-mismatch)
+              printf 'run_id=%s\nattempt=%s\nactor=%s\n' \
+                "$((GITHUB_RUN_ID-1))" "$GITHUB_RUN_ATTEMPT" "$GITHUB_TRIGGERING_ACTOR" >> "$GITHUB_OUTPUT"
+              echo "::warning::TEST MODE bind-mismatch：故意输出错误 run_id" ;;
+            no-binding)
+              echo "::warning::TEST MODE no-binding：故意不输出绑定" ;;
+            verify-reject)
+              echo "::error::TEST MODE verify-reject：模拟未获授权请求"; exit 1 ;;
+            *)
+              echo "::error::未知 mode：$MODE"; exit 1 ;;
+          esac
+  release:
+    needs: verify
+    if: >-
+      ${{
+        needs.verify.result == 'success' &&
+        needs.verify.outputs.authorized_private_run_id == github.run_id &&
+        needs.verify.outputs.authorized_private_attempt == github.run_attempt &&
+        needs.verify.outputs.authorized_triggering_actor == github.triggering_actor
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: ${{ inputs.group }}
+      cancel-in-progress: false
+    env:
+      MODE: ${{ inputs.mode }}
+      ROLE_TAG: ${{ inputs.tag }}
+      HOLD: ${{ inputs.hold_seconds }}
+    steps:
+      - name: Simulated deploy operation (markers + bounded hold)
+        run: |
+          set -eu
+          printf 'EXEC-START %s role=%s run=%s attempt=%s\n' \
+            "$(date -u +%FT%TZ)" "$ROLE_TAG" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          sleep "${HOLD:-120}"
+          if [ "$MODE" = exec-fail ]; then
+            printf 'EXEC-FAIL-MARKER %s role=%s\n' "$(date -u +%FT%TZ)" "$ROLE_TAG"
+            exit 1
+          fi
+          printf 'EXEC-END %s role=%s\n' "$(date -u +%FT%TZ)" "$ROLE_TAG"
+  finalize:
+    needs: [verify, release]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      STRICT_OK: >-
+        ${{
+          needs.verify.result == 'success' &&
+          needs.verify.outputs.authorized_private_run_id == github.run_id &&
+          needs.verify.outputs.authorized_private_attempt == github.run_attempt &&
+          needs.verify.outputs.authorized_triggering_actor == github.triggering_actor &&
+          needs.release.result == 'success'
+        }}
+      FINALIZE_HOLD: ${{ inputs.finalize_hold_seconds }}
+      ROLE_TAG: ${{ inputs.tag }}
+    steps:
+      - name: Strict result check (doc 15 §6.2 semantics)
+        run: |
+          printf '[finalize] %s role=%s verify=%s release=%s run=%s attempt=%s\n' \
+            "$(date -u +%FT%TZ)" "$ROLE_TAG" \
+            "${{ needs.verify.result }}" "${{ needs.release.result }}" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+          if [ "$STRICT_OK" != true ]; then
+            echo "finalize STRICT-FAIL（拒绝/no-op/失败案例的预期行为，不代表部署成功）"
+            exit 1
+          fi
+          echo "finalize STRICT-OK（模拟 deployed）"
+      - name: Finalize hold (C6)
+        run: |
+          s="${FINALIZE_HOLD:-0}"
+          if [ "$s" -gt 0 ]; then
+            printf 'FINALIZE-HOLD-START %s role=%s\n' "$(date -u +%FT%TZ)" "$ROLE_TAG"
+            sleep "$s"
+            printf 'FINALIZE-HOLD-END %s role=%s\n' "$(date -u +%FT%TZ)" "$ROLE_TAG"
+          fi
