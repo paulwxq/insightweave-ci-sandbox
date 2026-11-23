@@ -81,7 +81,8 @@ AB() { # AB <holdA> —— 前置：A 执行中、B verify 成功且 release 排
     vs=$(gh api "repos/$REPO/actions/runs/$AB_B/jobs?per_page=100" \
       --jq '.jobs[] | select(.name=="verify") | .status+"/"+(.conclusion//"-")')
     bs=$(jfield "$AB_B" '^release$' status)
-    if [ "$vs" = completed/success ] && [ "$bs" = queued ]; then ok=1; break; fi
+    # 实测（b11231341 probe）：job 级并发组等待中的 job 状态为 pending（非 queued）
+    if [ "$vs" = completed/success ] && { [ "$bs" = pending ] || [ "$bs" = queued ]; }; then ok=1; break; fi
     sleep 5
   done
   if [ -z "$ok" ]; then
